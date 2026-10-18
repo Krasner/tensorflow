@@ -19,6 +19,7 @@ limitations under the License.
 #define EIGEN_USE_GPU
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -413,6 +414,75 @@ __device__ __forceinline__ void LoadTile(bool chunks, T *__restrict__ s_mem,
   }
 }
 
+// Largest dynamic shared memory per block the current device allows with
+// opt-in, cached per device; 0 if unknown.
+inline int MaxSmemOptin() {
+  constexpr int kMaxDevices = 64;
+  static std::atomic<int> cached[kMaxDevices];  // 0 = not queried yet
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kMaxDevices) {
+    cudaGetLastError();
+    return 0;
+  }
+  int val = cached[dev].load(std::memory_order_relaxed);
+  if (val == 0) {
+    int max_smem = 0;
+    if (cudaDeviceGetAttribute(&max_smem,
+                               cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                               dev) != cudaSuccess) {
+      cudaGetLastError();  // don't leave the error for the next check
+      max_smem = 0;
+    }
+    val = max_smem > 0 ? max_smem : -1;
+    cached[dev].store(val, std::memory_order_relaxed);
+  }
+  return std::max(val, 0);
+}
+
+// Rows [tile_offset, tile_offset + rows) of one (batch, head) sequence into a
+// [rows][kLd] float tile, 16 bytes at a time with cp.async, zero-padding rows
+// past s_size and columns past d_size. Needs CanLoadChunks.
+template <int D_MAX, int kLd>
+__device__ __forceinline__ void LoadRowsPadded(float *__restrict__ s_mem,
+                                               const float *__restrict__ g_mem,
+                                               int tid, int threads, int rows,
+                                               int d_size, int s_size,
+                                               int tile_offset,
+                                               size_t row_base, int row_step) {
+  constexpr int kChunks = D_MAX / 4;
+  const int d_chunks = d_size / 4;
+  for (int i = tid; i < rows * kChunks; i += threads) {
+    const int r = i / kChunks;
+    const int c = i - r * kChunks;
+    const int s_offset = tile_offset + r;
+    const bool valid = s_offset < s_size && c < d_chunks;
+    const float *src =
+        valid ? g_mem +
+                    (row_base + static_cast<size_t>(s_offset) * row_step) *
+                        d_size +
+                    c * 4
+              : g_mem;
+    CpAsync16(s_mem + r * kLd + c * 4, src, valid);
+  }
+}
+
+__device__ __forceinline__ float Lane(const float4 &v, int i) {
+  return i == 0 ? v.x : (i == 1 ? v.y : (i == 2 ? v.z : v.w));
+}
+
+// a += s * v, elementwise over the 4 lanes.
+__device__ __forceinline__ void Fma4(float (&a)[4], float s, const float4 &v) {
+  a[0] += s * v.x;
+  a[1] += s * v.y;
+  a[2] += s * v.z;
+  a[3] += s * v.w;
+}
+
+__device__ __forceinline__ float Dot4(const float4 &a, const float4 &b,
+                                      float acc) {
+  return acc + a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+}
+
 namespace traits {
 
 // The fallback kernels' dynamic shared memory stays within the 48KB that needs
@@ -569,6 +639,87 @@ constexpr int BwdKVSmemBytes() {
   static_assert(bytes <= kMaxSmemBytes);
   return bytes;
 }
+
+/*
+float forward pass in GEMM form (FlashAttnFwdGemmKernel): 256 threads as
+16 x 16, Br = 64 query rows. Q, K, V tiles are padded to a row stride of
+D_MAX + 4 floats (as in BwdGemmLayout); the P tile to Bc + 16, which puts
+the two rows a warp writes in opposite halves of the banks.
+*/
+template <int D_MAX>
+struct FlashTraitsFwdGemm;
+template <>
+struct FlashTraitsFwdGemm<64> {
+  static constexpr int Bc = 64;
+  static constexpr int kStages = 1;
+  // 2 blocks per SM: registers <= 128, and ~68KB of shared memory each.
+  static constexpr int kMinBlocks = 2;
+};
+template <>
+struct FlashTraitsFwdGemm<128> {
+  // Bc = 32 so that two K/V stages fit next to the Q tile.
+  static constexpr int Bc = 32;
+  static constexpr int kStages = 2;
+  static constexpr int kMinBlocks = 1;
+};
+
+template <int D_MAX>
+struct FwdGemmLayout {
+  static constexpr int Th = 256;
+  static constexpr int Br = 64;
+  static constexpr int Bc = FlashTraitsFwdGemm<D_MAX>::Bc;
+  static constexpr int kStages = FlashTraitsFwdGemm<D_MAX>::kStages;
+  static constexpr int kMinBlocks = FlashTraitsFwdGemm<D_MAX>::kMinBlocks;
+  static constexpr int kLd = D_MAX + 4;  // Q, K, V
+  static constexpr int kLdP = Bc + 16;   // P
+  static constexpr int kStageFloats = 2 * Bc * kLd;  // K and V tiles
+  static constexpr int SmemBytes() {
+    return (Br * kLd + kStages * kStageFloats + Br * kLdP) * sizeof(float);
+  }
+};
+
+/*
+float backward KV pass in GEMM form (FlashAttnBwdGemmKernel): 256 threads as
+16 x 16, Bc = 64 keys. Tiles are padded to row strides of D_MAX + 4 floats (Q,
+dO, K, V), Br + 4 (P^T, dS^T) and Bc + 4 (dS), which keeps the 16-byte reads
+of 8 consecutive rows in distinct bank groups. Needs more than the 48KB of
+shared memory available without opt-in.
+*/
+template <int D_MAX>
+struct FlashTraitsBwdGemm;
+template <>
+struct FlashTraitsBwdGemm<64> {
+  static constexpr int Br = 32;
+  static constexpr int kStages = 1;
+  // __launch_bounds__ blocks per SM: 2 caps registers at 128 (ptxas picks 192
+  // otherwise), and the ~78KB of shared memory also allows 2.
+  static constexpr int kMinBlocks = 2;
+};
+template <>
+struct FlashTraitsBwdGemm<128> {
+  static constexpr int Br = 32;
+  static constexpr int kStages = 1;
+  static constexpr int kMinBlocks = 1;
+};
+
+template <int D_MAX>
+struct BwdGemmLayout {
+  static constexpr int Th = 256;
+  static constexpr int Bc = 64;
+  static constexpr int Br = FlashTraitsBwdGemm<D_MAX>::Br;
+  static constexpr int kStages = FlashTraitsBwdGemm<D_MAX>::kStages;
+  static constexpr int kMinBlocks = FlashTraitsBwdGemm<D_MAX>::kMinBlocks;
+  static constexpr int kLd = D_MAX + 4;   // Q, dO, K, V
+  static constexpr int kLdT = Br + 4;     // P^T, dS^T
+  static constexpr int kLdS = Bc + 4;     // dS
+  // Q, dO tiles + Stats, dOsum.
+  static constexpr int kStageFloats = 2 * Br * kLd + 2 * Br;
+  static constexpr int SmemBytes(bool accumulate_dq) {
+    return (2 * Bc * kLd + kStages * kStageFloats + 2 * Bc * kLdT +
+            (accumulate_dq ? Br * kLdS : 0)) *
+           sizeof(float);
+  }
+};
 
 /*
 backward Q pass:

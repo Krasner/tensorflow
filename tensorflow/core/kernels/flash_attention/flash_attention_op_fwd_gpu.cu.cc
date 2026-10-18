@@ -224,6 +224,262 @@ __global__ void __launch_bounds__(traits::FlashTraits<D_MAX>::Th,
   }
 }
 
+// The float version of FlashAttnFwdKernel, written as matrix products so that
+// each value read from shared memory feeds several multiply-adds. A block owns
+// Br = 64 query rows; its 256 threads form a 16 x 16 grid (ty, tx). For each
+// KV tile of Bc keys:
+//  1. S = Q K^T: thread (ty, tx) computes rows ty + 16a and keys tx + 16b.
+//  2. Online softmax: a row's scores are spread over the 16 threads with the
+//     same ty (one half of a warp), which reduce the running max with
+//     shuffles. Each keeps a partial row sum, rescaled with the row's factor,
+//     and adds them up at the end. P goes to shared memory.
+//  3. O += P V: thread (ty, tx) owns rows ty + 16a and columns
+//     [4 (tx + 16e), +4).
+template <int D_MAX>
+__global__ void __launch_bounds__(traits::FwdGemmLayout<D_MAX>::Th,
+                                  traits::FwdGemmLayout<D_MAX>::kMinBlocks)
+    FlashAttnFwdGemmKernel(const float *__restrict__ Q,
+                           const float *__restrict__ K,
+                           const float *__restrict__ V, float *__restrict__ Out,
+                           float *__restrict__ stats_out, int BH, int H,
+                           int S_q, int S_kv, int D_qk, int D_v,
+                           bool causal_mask, float dropout_rate, float scale,
+                           FlashAttentionRng rng) {
+  using L = traits::FwdGemmLayout<D_MAX>;
+  constexpr int Br = L::Br;
+  constexpr int Bc = L::Bc;
+  constexpr int kStages = L::kStages;
+  constexpr int kLd = L::kLd;
+  constexpr int kLdP = L::kLdP;
+  constexpr int kRA = Br / 16;     // rows per thread
+  constexpr int kKB = Bc / 16;     // keys per thread in step 1
+  constexpr int kDC = D_MAX / 64;  // 4-column chunks per thread in step 3
+  static_assert(L::Th == 256 && Bc % 16 == 0 && D_MAX % 64 == 0);
+
+  const uint64_t seed = ResolveSeed(rng);
+  const uint64_t offset = ResolveOffset(rng);
+  const float dp_inverse =
+      (dropout_rate > 0.0f) ? (1.0f / (1.0f - dropout_rate)) : 1.0f;
+
+  // Shared Memory Layout:
+  // Q[Br][kLd] | kStages x (K[Bc][kLd] | V[Bc][kLd]) | P[Br][kLdP]
+  extern __shared__ __align__(16) char smem_[];
+  float *s_Q = reinterpret_cast<float *>(smem_);
+  float *s_stages = s_Q + Br * kLd;
+  float *s_P = s_stages + kStages * L::kStageFloats;
+
+  const int tid = threadIdx.x;
+  const int tx = tid % 16;
+  const int ty = tid / 16;
+
+  // Blocks go through the Q tiles last to first (across all heads), so that
+  // with causal masking the tiles with the most keys start first and the
+  // short ones fill in at the end.
+  const int tiles_per_batch = (S_q + Br - 1) / Br;
+  const bool block_valid = blockIdx.x < tiles_per_batch * BH;
+  const int bh = block_valid ? blockIdx.x % BH : 0;
+  const int tile_idx_q =
+      block_valid ? tiles_per_batch - 1 - static_cast<int>(blockIdx.x / BH)
+                  : 0;
+  const int b = bh / H;
+  const int h = bh - b * H;
+  const int tile_offset_q = tile_idx_q * Br;
+  const size_t batch_offset_q = static_cast<size_t>(bh) * S_q;
+  const size_t row_base_q = RowBase(b, h, S_q, H);
+  const size_t row_base_kv = RowBase(b, h, S_kv, H);
+
+  float acc_o[kRA][4 * kDC];
+  float m_i[kRA], l_i[kRA];  // l_i: this thread's keys only
+#pragma unroll
+  for (int ra = 0; ra < kRA; ++ra) {
+    m_i[ra] = NEGINF;
+    l_i[ra] = ZEROF;
+#pragma unroll
+    for (int d = 0; d < 4 * kDC; ++d) acc_o[ra][d] = ZEROF;
+  }
+
+  // Arrives with the first K/V tile.
+  if (block_valid) {
+    LoadRowsPadded<D_MAX, kLd>(s_Q, Q, tid, L::Th, Br, D_qk, S_q,
+                               tile_offset_q, row_base_q, H);
+  }
+
+  // As in FlashAttnFwdKernel: with causal masking, KV tiles past the Q tile's
+  // last row are skipped; the range is the same for the whole block.
+  const int kv_end =
+      !block_valid ? 0
+                   : (causal_mask ? std::min(S_kv, tile_offset_q + Br) : S_kv);
+  const int kv_tiles = (kv_end + Bc - 1) / Bc;
+  auto stage = [&](int t) {
+    return s_stages + (t % kStages) * L::kStageFloats;
+  };
+  auto load_kv = [&](int t) {
+    float *sK = stage(t);
+    LoadRowsPadded<D_MAX, kLd>(sK, K, tid, L::Th, Bc, D_qk, S_kv, t * Bc,
+                               row_base_kv, H);
+    LoadRowsPadded<D_MAX, kLd>(sK + Bc * kLd, V, tid, L::Th, Bc, D_v, S_kv,
+                               t * Bc, row_base_kv, H);
+  };
+
+  if constexpr (kStages > 1) {
+    if (kv_tiles > 0) load_kv(0);
+    CpAsyncCommit();
+  }
+  for (int t = 0; t < kv_tiles; ++t) {
+    if constexpr (kStages == 1) {
+      load_kv(t);
+      CpAsyncCommit();
+    }
+    CpAsyncWait<0>();
+    // Makes tile t visible. Every thread is also done with tile t - 1, so its
+    // stage and the P tile can be overwritten.
+    __syncthreads();
+    if constexpr (kStages > 1) {
+      if (t + 1 < kv_tiles) load_kv(t + 1);
+      CpAsyncCommit();
+    }
+    const float *sK = stage(t);
+    const float *sV = sK + Bc * kLd;
+    const int tile_offset_kv = t * Bc;
+
+    // 1. S = Q K^T.
+    float acc_s[kRA][kKB];
+#pragma unroll
+    for (int ra = 0; ra < kRA; ++ra) {
+#pragma unroll
+      for (int kb = 0; kb < kKB; ++kb) acc_s[ra][kb] = ZEROF;
+    }
+#pragma unroll 4
+    for (int k = 0; k < D_MAX; k += 4) {
+      float4 q[kRA], kk[kKB];
+#pragma unroll
+      for (int ra = 0; ra < kRA; ++ra) {
+        q[ra] =
+            *reinterpret_cast<const float4 *>(s_Q + (ty + 16 * ra) * kLd + k);
+      }
+#pragma unroll
+      for (int kb = 0; kb < kKB; ++kb) {
+        kk[kb] =
+            *reinterpret_cast<const float4 *>(sK + (tx + 16 * kb) * kLd + k);
+      }
+#pragma unroll
+      for (int ra = 0; ra < kRA; ++ra) {
+#pragma unroll
+        for (int kb = 0; kb < kKB; ++kb) {
+          acc_s[ra][kb] = Dot4(q[ra], kk[kb], acc_s[ra][kb]);
+        }
+      }
+    }
+
+    // 2. Online softmax. Keys past S_kv and causally masked ones get -inf,
+    // so probability 0.
+#pragma unroll
+    for (int ra = 0; ra < kRA; ++ra) {
+      const int r = ty + 16 * ra;
+      const int q_offset = tile_offset_q + r;
+      float m_tile = -INFINITY;
+#pragma unroll
+      for (int kb = 0; kb < kKB; ++kb) {
+        const int kv_offset = tile_offset_kv + tx + 16 * kb;
+        const bool valid =
+            kv_offset < S_kv && !(causal_mask && q_offset < kv_offset);
+        acc_s[ra][kb] = valid ? acc_s[ra][kb] * scale : -INFINITY;
+        m_tile = fmaxf(m_tile, acc_s[ra][kb]);
+      }
+#pragma unroll
+      for (int lane_mask = 1; lane_mask < 16; lane_mask <<= 1) {
+        m_tile = fmaxf(m_tile, __shfl_xor_sync(0xffffffffu, m_tile, lane_mask));
+      }
+      const float m_new = fmaxf(m_i[ra], m_tile);
+      const float ratio = Eigen::numext::exp(m_i[ra] - m_new);
+      m_i[ra] = m_new;
+      l_i[ra] *= ratio;
+#pragma unroll
+      for (int d = 0; d < 4 * kDC; ++d) acc_o[ra][d] *= ratio;
+      const uint64_t global_rng_idx =
+          seed + offset +
+          static_cast<uint64_t>((batch_offset_q + q_offset) * S_kv);
+#pragma unroll
+      for (int kb = 0; kb < kKB; ++kb) {
+        const int c = tx + 16 * kb;
+        float p_ij = Eigen::numext::exp(acc_s[ra][kb] - m_new);
+        l_i[ra] += p_ij;
+        if (dropout_rate > 0.0f) {
+          if (get_random_float_v2(global_rng_idx, tile_offset_kv + c) <
+              dropout_rate) {
+            p_ij = ZEROF;
+          } else {
+            p_ij *= dp_inverse;
+          }
+        }
+        s_P[r * kLdP + c] = p_ij;
+      }
+    }
+    __syncthreads();
+
+    // 3. O += P V.
+#pragma unroll 2
+    for (int c = 0; c < Bc; c += 4) {
+      float4 p[kRA];
+#pragma unroll
+      for (int ra = 0; ra < kRA; ++ra) {
+        p[ra] =
+            *reinterpret_cast<const float4 *>(s_P + (ty + 16 * ra) * kLdP + c);
+      }
+#pragma unroll
+      for (int cc = 0; cc < 4; ++cc) {
+#pragma unroll
+        for (int e = 0; e < kDC; ++e) {
+          const float4 v = *reinterpret_cast<const float4 *>(
+              sV + (c + cc) * kLd + 4 * (tx + 16 * e));
+#pragma unroll
+          for (int ra = 0; ra < kRA; ++ra) {
+            const float pv = Lane(p[ra], cc);
+            acc_o[ra][4 * e + 0] += pv * v.x;
+            acc_o[ra][4 * e + 1] += pv * v.y;
+            acc_o[ra][4 * e + 2] += pv * v.z;
+            acc_o[ra][4 * e + 3] += pv * v.w;
+          }
+        }
+      }
+    }
+    if constexpr (kStages == 1) {
+      // The next iteration overwrites this K/V tile.
+      __syncthreads();
+    }
+  }
+  // The Q copies are still in flight if there was no KV tile.
+  CpAsyncWait<0>();
+
+#pragma unroll
+  for (int ra = 0; ra < kRA; ++ra) {
+    float l = l_i[ra];
+#pragma unroll
+    for (int lane_mask = 1; lane_mask < 16; lane_mask <<= 1) {
+      l += __shfl_xor_sync(0xffffffffu, l, lane_mask);
+    }
+    const int q_offset = tile_offset_q + ty + 16 * ra;
+    if (!block_valid || q_offset >= S_q) continue;
+    // As in FlashAttnFwdKernel: l >= 1 once any key is attended, and a row
+    // without keys gets an LSE of -inf and a zero output.
+    const bool has_keys = l > ZEROF;
+    if (tx == 0) {
+      stats_out[batch_offset_q + q_offset] =
+          has_keys ? m_i[ra] + Eigen::numext::log(l) : -INFINITY;
+    }
+    const float inv_l = has_keys ? (1.0f / l) : ZEROF;
+    float *out = Out + (row_base_q + static_cast<size_t>(q_offset) * H) * D_v;
+#pragma unroll
+    for (int e = 0; e < kDC; ++e) {
+      const int col = 4 * (tx + 16 * e);
+      if (col >= D_v) continue;  // D_v is a multiple of 4
+      *reinterpret_cast<float4 *>(out + col) = make_float4(
+          acc_o[ra][4 * e] * inv_l, acc_o[ra][4 * e + 1] * inv_l,
+          acc_o[ra][4 * e + 2] * inv_l, acc_o[ra][4 * e + 3] * inv_l);
+    }
+  }
+}
+
 template <typename T>
 struct FlashAttentionFunctor<GPUDevice, T> {
   static constexpr bool kIsBf16 = std::is_same_v<T, Eigen::bfloat16>;
@@ -298,6 +554,34 @@ struct FlashAttentionFunctor<GPUDevice, T> {
   }
 
   template <int D_MAX>
+  absl::Status LaunchGemmKernel(const GPUDevice &d, const float *Q,
+                                const float *K, const float *V, float *Out,
+                                float *Stats, int BH, int H, int S_q, int S_kv,
+                                int D_qk, int D_v, bool causal_mask,
+                                float dropout_rate, float scale,
+                                FlashAttentionRng rng) const {
+    using Layout = traits::FwdGemmLayout<D_MAX>;
+    constexpr int smem_size = Layout::SmemBytes();
+    auto kernel = FlashAttnFwdGemmKernel<D_MAX>;
+    if (cudaError_t err = cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        err != cudaSuccess) {
+      return errors::Internal("FlashAttention: setting shared memory failed: ",
+                              cudaGetErrorString(err));
+    }
+    const uint64_t total_blocks =
+        static_cast<uint64_t>(BH) * ((S_q + Layout::Br - 1) / Layout::Br);
+    if (total_blocks > 2147483647ULL) {
+      return errors::InvalidArgument(
+          "FlashAttention: total blocks exceed 1D grid limit");
+    }
+    return GpuLaunchKernel(kernel, static_cast<int>(total_blocks), Layout::Th,
+                           smem_size, d.stream(), Q, K, V, Out, Stats, BH, H,
+                           S_q, S_kv, D_qk, D_v, causal_mask, dropout_rate,
+                           scale, rng);
+  }
+
+  template <int D_MAX>
   absl::Status LaunchKernel(const GPUDevice &d,
                             typename TTypes<T, 4>::ConstTensor Q,
                             typename TTypes<T, 4>::ConstTensor K,
@@ -307,11 +591,22 @@ struct FlashAttentionFunctor<GPUDevice, T> {
                             int H, int S_q, int S_kv, int D_qk, int D_v,
                             bool causal_mask, float dropout_rate, float scale,
                             FlashAttentionRng rng) const {
+    const int BH = B * H;  // fits in int, see CheckDimsFitInt32
+    const bool load_chunks =
+        CanLoadChunks<T>({Q.data(), K.data(), V.data()}, {D_qk, D_v});
+    if constexpr (std::is_same_v<T, float> && D_MAX >= 64) {
+      if (load_chunks &&
+          MaxSmemOptin() >= traits::FwdGemmLayout<D_MAX>::SmemBytes()) {
+        return LaunchGemmKernel<D_MAX>(d, Q.data(), K.data(), V.data(),
+                                       Out.data(), Stats.data(), BH, H, S_q,
+                                       S_kv, D_qk, D_v, causal_mask,
+                                       dropout_rate, scale, rng);
+      }
+    }
     constexpr int Br = traits::FlashTraits<D_MAX>::Br;
     constexpr int threads_per_block = traits::FlashTraits<D_MAX>::Th;
     constexpr int smem_size = traits::FwdSmemBytes<T, D_MAX>();
     uint64_t blocks_per_batch = (S_q + Br - 1) / Br;
-    const int BH = B * H;  // fits in int, see CheckDimsFitInt32
     uint64_t total_blocks = static_cast<uint64_t>(BH) * blocks_per_batch;
     if (total_blocks > 2147483647ULL) {
       return errors::InvalidArgument(
@@ -321,9 +616,7 @@ struct FlashAttentionFunctor<GPUDevice, T> {
                            threads_per_block, smem_size, d.stream(), Q.data(),
                            K.data(), V.data(), Out.data(), Stats.data(), BH, H,
                            S_q, S_kv, D_qk, D_v, causal_mask, dropout_rate,
-                           scale, rng,
-                           CanLoadChunks<T>({Q.data(), K.data(), V.data()},
-                                            {D_qk, D_v}));
+                           scale, rng, load_chunks);
   }
 };
 
